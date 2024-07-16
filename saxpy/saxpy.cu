@@ -140,6 +140,7 @@ void printCudaInfo() {
         printf("   Global mem: %.0f MB\n",
                static_cast<float>(deviceProps.totalGlobalMem) / (1024 * 1024));
         printf("   CUDA Cap:   %d.%d\n", deviceProps.major, deviceProps.minor);
+        printf("   Shared mem per block: %.0f KB\n", static_cast<float>(deviceProps.sharedMemPerBlock));
     }
     printf("---------------------------------------------------------\n");
 }

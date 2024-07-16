@@ -27,6 +27,43 @@ static inline int nextPow2(int n) {
     return n;
 }
 
+__global__ void upSweep(int *result, int n, int step) {
+    long long idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if ((idx + 1) * step - 1 < n) {
+        result[(idx + 1) * step - 1] += result[idx * step + (step >> 1) - 1];
+    }
+}
+
+__global__ void downSweep(int *result, int n, int step) {
+    long long idx = blockIdx.x * blockDim.x + threadIdx.x;
+    long long id1 = idx * step + (step >> 1) - 1;
+    long long id2 = (idx + 1) * step - 1;
+    if (id2 < n) {
+        int tmp = result[id1];
+        result[id1] = result[id2];
+        result[id2] += tmp;
+    }
+}
+
+__device__ void upSweepLocal(int *output, int n, long long start, int step) {
+    long long idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (step == 1) {
+        
+    }
+    long long id1 = start + idx * step + (step >> 1) - 1;
+    long long id2 = start + (idx + 1) * step - 1;
+    if (id2 - start < n) {
+        output[id2] += output[id1];
+    }
+}
+
+__global__ void scanLocal(int *result, int n) {
+    // __shared__ int output[n];
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    long long start = idx * n;
+    
+}
+
 // exclusive_scan --
 //
 // Implementation of an exclusive scan on global memory array `input`,
@@ -44,17 +81,29 @@ static inline int nextPow2(int n) {
 // places it in result
 void exclusive_scan(int* input, int N, int* result)
 {
-
-    // CS149 TODO:
-    //
-    // Implement your exclusive scan implementation here.  Keep in
-    // mind that although the arguments to this function are device
-    // allocated arrays, this is a function that is running in a thread
-    // on the CPU.  Your implementation will need to make multiple calls
-    // to CUDA kernel functions (that you must write) to implement the
-    // scan.
-
-
+    int rounded_n = nextPow2(N);
+    for (int step = 1; step <= (rounded_n >> 1); step <<= 1) {
+        int cur_step = step << 1;
+        int thread_num = rounded_n / cur_step;
+        int block_num = (thread_num - 1) / THREADS_PER_BLOCK + 1;
+        upSweep<<<block_num, THREADS_PER_BLOCK>>>(result, rounded_n, cur_step);
+        cudaError_t err = cudaDeviceSynchronize();
+        if (err != cudaSuccess) {
+            printf("kernel launch failed with error: %s\n", cudaGetErrorString(err));
+        }
+    }
+    int tmp = 0;
+    cudaMemcpy(&result[rounded_n - 1], &tmp, sizeof(int), cudaMemcpyHostToDevice);
+    for (int step = (rounded_n >> 1); step >= 1; step >>= 1) {
+        int cur_step = step << 1;
+        int thread_num = rounded_n / cur_step;
+        int block_num = (thread_num - 1) / THREADS_PER_BLOCK + 1;
+        downSweep<<<block_num, THREADS_PER_BLOCK>>>(result, rounded_n, cur_step);
+        cudaError_t err = cudaDeviceSynchronize();
+        if (err != cudaSuccess) {
+            printf("kernel launch failed with error: %s\n", cudaGetErrorString(err));
+        }
+    }
 }
 
 
@@ -217,6 +266,8 @@ void printCudaInfo()
         printf("   Global mem: %.0f MB\n",
                static_cast<float>(deviceProps.totalGlobalMem) / (1024 * 1024));
         printf("   CUDA Cap:   %d.%d\n", deviceProps.major, deviceProps.minor);
+        printf("   Shared mem per block: %.0f KB\n", static_cast<float>(deviceProps.sharedMemPerBlock));
+        printf("   Max threads per block: %d cuda threads\n", deviceProps.maxThreadsPerBlock);
     }
     printf("---------------------------------------------------------\n"); 
 }
