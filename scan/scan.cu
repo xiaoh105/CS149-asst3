@@ -13,7 +13,7 @@
 #include "CycleTimer.h"
 
 #define THREADS_PER_BLOCK 256
-
+#define MAX_THREADS_PER_BLOCK 1024
 
 // helper function to round an integer up to the next power of 2
 static inline int nextPow2(int n) {
@@ -45,41 +45,7 @@ __global__ void downSweep(int *result, int n, int step) {
     }
 }
 
-__device__ void upSweepLocal(int *output, int n, long long start, int step) {
-    long long idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (step == 1) {
-        
-    }
-    long long id1 = start + idx * step + (step >> 1) - 1;
-    long long id2 = start + (idx + 1) * step - 1;
-    if (id2 - start < n) {
-        output[id2] += output[id1];
-    }
-}
-
-__global__ void scanLocal(int *result, int n) {
-    // __shared__ int output[n];
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    long long start = idx * n;
-    
-}
-
-// exclusive_scan --
-//
-// Implementation of an exclusive scan on global memory array `input`,
-// with results placed in global memory `result`.
-//
-// N is the logical size of the input and output arrays, however
-// students can assume that both the start and result arrays we
-// allocated with next power-of-two sizes as described by the comments
-// in cudaScan().  This is helpful, since your parallel scan
-// will likely write to memory locations beyond N, but of course not
-// greater than N rounded up to the next power of 2.
-//
-// Also, as per the comments in cudaScan(), you can implement an
-// "in-place" scan, since the timing harness makes a copy of input and
-// places it in result
-void exclusive_scan(int* input, int N, int* result)
+void exclusiveScanNaive(int N, int* result)
 {
     int rounded_n = nextPow2(N);
     for (int step = 1; step <= (rounded_n >> 1); step <<= 1) {
@@ -104,6 +70,112 @@ void exclusive_scan(int* input, int N, int* result)
             printf("kernel launch failed with error: %s\n", cudaGetErrorString(err));
         }
     }
+}
+
+__global__ void scanBlock(int *result, int n, int *last) {
+    extern __shared__ int output[MAX_THREADS_PER_BLOCK];
+    extern __shared__ int sum[MAX_THREADS_PER_BLOCK / 32];
+    int id = threadIdx.x;
+    long long global_id = blockIdx.x * blockDim.x + threadIdx.x;
+    n -= blockIdx.x * blockDim.x;
+    // Note that scan with length <= 2 may cause array out of bound!!!
+    if (id * 4 < min(n, MAX_THREADS_PER_BLOCK)) {
+        reinterpret_cast<int4*>(output)[id] = 
+            reinterpret_cast<int4*>(&result[blockIdx.x * blockDim.x])[threadIdx.x];
+    }
+    __syncthreads();
+    int lane = id & 31;
+    int warp_id = id >> 5;
+    if (id < n) {
+        auto mask = __activemask();
+        if (lane >= 1) { output[id] += output[id - 1]; }
+        __syncwarp(mask);
+        if (lane >= 2) { output[id] += output[id - 2]; }
+        __syncwarp(mask);
+        if (lane >= 4) { output[id] += output[id - 4]; }
+        __syncwarp(mask);
+        if (lane >= 8) { output[id] += output[id - 8]; }
+        __syncwarp(mask);
+        if (lane >= 16) { output[id] += output[id - 16]; }
+        __syncwarp(mask);
+        if (lane == 31) { sum[warp_id] = output[id]; }
+    }
+    __syncthreads();
+    if (warp_id == 0) {
+        auto mask = __activemask();
+        if (lane >= 1) { sum[lane] += sum[lane - 1]; }
+        __syncwarp(mask);
+        if (lane >= 2) { sum[lane] += sum[lane - 2]; }
+        __syncwarp(mask);
+        if (lane >= 4) { sum[lane] += sum[lane - 4]; }
+        __syncwarp(mask);
+        if (lane >= 8) { sum[lane] += sum[lane - 8]; }
+        __syncwarp(mask);
+        if (lane >= 16) { sum[lane] += sum[lane - 16]; }
+        __syncwarp(mask);
+        sum[lane] = (lane > 0) ? sum[lane - 1] : 0;
+    }
+    __syncthreads();
+    if (id < n) {
+        result[global_id] = (lane == 0 ? 0 : output[id - 1]) + sum[warp_id];
+    }
+    if (id == blockDim.x - 1 && last != nullptr) {
+        last[blockIdx.x] = id < n ? output[id] + sum[warp_id] : 0;
+    }
+}
+
+__global__ void addBlock(int *result, int n, int *last) {
+    int id = blockIdx.x * blockDim.x + threadIdx.x;
+    int block_id = blockIdx.x;
+    if (id < n) {
+        result[id] += last[block_id];
+    }
+}
+
+void exclusiveScanBlock(int N, int *result) {
+    int round_n = nextPow2(N);
+    int block_num = (round_n - 1) / MAX_THREADS_PER_BLOCK + 1;
+    int *last;
+    int last_len = nextPow2((block_num - 1) / MAX_THREADS_PER_BLOCK + 1) * MAX_THREADS_PER_BLOCK;
+    cudaMalloc(&last, last_len * sizeof(int));
+    scanBlock<<<block_num, MAX_THREADS_PER_BLOCK>>>(result, round_n, last);
+    cudaError_t err = cudaDeviceSynchronize();
+    if (err != cudaSuccess) {
+        printf("kernel launch failed with error in stage 1: %s\n", cudaGetErrorString(err));
+        exit(0);
+    }
+    if (block_num <= MAX_THREADS_PER_BLOCK) {
+        scanBlock<<<1, MAX_THREADS_PER_BLOCK>>>(last, nextPow2(block_num), nullptr);
+        cudaError_t err = cudaDeviceSynchronize();
+        if (err != cudaSuccess) {
+            printf("kernel launch failed with error in stage 2: %s\n", cudaGetErrorString(err));
+            exit(0);
+        }
+    } else {
+        exclusiveScanBlock(block_num, last);
+    }
+    addBlock<<<block_num, MAX_THREADS_PER_BLOCK>>>(result, round_n, last);
+}
+
+// exclusive_scan --
+//
+// Implementation of an exclusive scan on global memory array `input`,
+// with results placed in global memory `result`.
+//
+// N is the logical size of the input and output arrays, however
+// students can assume that both the start and result arrays we
+// allocated with next power-of-two sizes as described by the comments
+// in cudaScan().  This is helpful, since your parallel scan
+// will likely write to memory locations beyond N, but of course not
+// greater than N rounded up to the next power of 2.
+//
+// Also, as per the comments in cudaScan(), you can implement an
+// "in-place" scan, since the timing harness makes a copy of input and
+// places it in result
+void exclusive_scan(int* input, int N, int* result)
+{
+    // exclusiveScanBlock(N, result);
+    exclusiveScanBlock(N, result);
 }
 
 
@@ -189,6 +261,20 @@ double cudaScanThrust(int* inarray, int* end, int* resultarray) {
     return overallDuration; 
 }
 
+__global__ void scanIdentical(int *input, int n, int *output) {
+    int id = blockIdx.x * blockDim.x + threadIdx.x;
+    if (id == 0) {
+        output[0] = 0;
+    }
+    output[id + 1] = (id + 1 < n && input[id] == input[id + 1]) ? 1 : 0;
+}
+
+__global__ void collectOutput(int *input, int n, int *output) {
+    int id = blockIdx.x * blockDim.x + threadIdx.x;
+    if (id + 1 < n && input[id] < input[id + 1]) {
+        output[input[id]] = id - 1;
+    }
+}
 
 // find_repeats --
 //
@@ -197,20 +283,18 @@ double cudaScanThrust(int* inarray, int* end, int* resultarray) {
 //
 // Returns the total number of pairs found
 int find_repeats(int* device_input, int length, int* device_output) {
-
-    // CS149 TODO:
-    //
-    // Implement this function. You will probably want to
-    // make use of one or more calls to exclusive_scan(), as well as
-    // additional CUDA kernel launches.
-    //    
-    // Note: As in the scan code, the calling code ensures that
-    // allocated arrays are a power of 2 in size, so you can use your
-    // exclusive_scan function with them. However, your implementation
-    // must ensure that the results of find_repeats are correct given
-    // the actual array length.
-
-    return 0; 
+    int round_n = nextPow2(length);
+    int *tmp;
+    cudaMalloc(&tmp, round_n * sizeof(int));
+    int block_num = length / THREADS_PER_BLOCK + 1;
+    scanIdentical<<<block_num, THREADS_PER_BLOCK>>>(device_input, length, device_output);
+    cudaMemcpy(tmp, device_output, (length + 1) * sizeof(int), cudaMemcpyDeviceToDevice);
+    exclusiveScanBlock(length + 1, tmp);
+    int res;
+    cudaMemcpy(&res, &tmp[length], sizeof(int), cudaMemcpyDeviceToHost);
+    collectOutput<<<block_num, THREADS_PER_BLOCK>>>(tmp, length + 1, device_output);
+    cudaFree(tmp);
+    return res;
 }
 
 
